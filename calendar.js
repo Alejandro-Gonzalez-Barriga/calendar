@@ -3,256 +3,492 @@ const UMBRAGE_KEYWORD = "Umbrage";
 const PROJECT_CALL_TITLES = ["Project call", "Resla", "CheckSammy", "RevStar"];
 const TIMEZONE = "America/Mexico_City";
 const SCRIPT_TAG = "Created by Script";
+const MONTH_SHEET_NAME_PATTERN = /^([A-Za-z]+)\s+(\d{4})$/;
+const MONTH_NAME_TO_INDEX = Object.freeze({
+  jan: 0,
+  january: 0,
+  feb: 1,
+  february: 1,
+  mar: 2,
+  march: 2,
+  apr: 3,
+  april: 3,
+  may: 4,
+  jun: 5,
+  june: 5,
+  jul: 6,
+  july: 6,
+  aug: 7,
+  august: 7,
+  sep: 8,
+  sept: 8,
+  september: 8,
+  oct: 9,
+  october: 9,
+  nov: 10,
+  november: 10,
+  dec: 11,
+  december: 11,
+});
 
 const SHEET_CONFIG = Object.freeze({
   spreadsheetId: "1AMGUOTTL3cVrhNcy55xRIDFllFoBAgL5iRkjvWXAa50",
-  sheetName: "Jan 2026",
-  startRow: 12,
-  lastRow: 35,
+  startRow: 11,
+  lastRow: 37,
   dateRow: 3,
-  dateCol: 3,      // column C
-  numDateCols: 28,
-  timeCol: 1,      // column A
+  dateColumn: 2, // column B
+  dateColumnCount: 35,
+  timeColumn: 1, // column A
 });
 
-// Safely normalize titles
-const normalizeTitle = (title = "") => {
-  const str = String(title || "").trim();
-  return str.startsWith(UMBRAGE_KEYWORD) ? UMBRAGE_KEYWORD : str;
-};
+// Safely normalize titles. If Apps Script runs this helper directly, run the sync.
+function normalizeTitle(title) {
+  if (typeof title === "undefined") {
+    createCalendarEvents();
+    return "";
+  }
+
+  const normalizedTitle = String(title || "").trim();
+  return normalizedTitle.startsWith(UMBRAGE_KEYWORD) ? UMBRAGE_KEYWORD : normalizedTitle;
+}
 
 const buildEventKey = (title, startTime, endTime) =>
   `${title}|${startTime.getTime()}|${endTime.getTime()}`;
 
+function log(message) {
+  console.log(message);
+}
+
+function parseSheetTime(timeLabel, rawTimeValue) {
+  if (rawTimeValue instanceof Date && !isNaN(rawTimeValue)) {
+    const hour = rawTimeValue.getHours();
+    const minute = rawTimeValue.getMinutes();
+    return { hour, minute, originalHour: hour % 12 || 12, period: hour < 12 ? "AM" : "PM" };
+  }
+
+  if (typeof rawTimeValue === "number" && !isNaN(rawTimeValue)) {
+    const minutesInDay = 24 * 60;
+    const totalMinutes = Math.round((rawTimeValue % 1) * minutesInDay);
+    const hour = Math.floor(totalMinutes / 60) % 24;
+    const minute = totalMinutes % 60;
+    return { hour, minute, originalHour: hour % 12 || 12, period: hour < 12 ? "AM" : "PM" };
+  }
+
+  const startTimeLabel = String(timeLabel || "").split("/")[0].trim();
+  const timeMatch = startTimeLabel
+    .trim()
+    .match(/^(\d{1,2})(?::(\d{2}))?\s*([ap]\.?m\.?)?$/i);
+
+  if (!timeMatch) return null;
+
+  let hour = Number(timeMatch[1]);
+  const minute = Number(timeMatch[2] || 0);
+  const period = timeMatch[3] ? timeMatch[3].replace(/\./g, "").toUpperCase() : "";
+  const originalHour = hour;
+
+  if (period === "AM") {
+    if (hour === 12) hour = 0;
+  } else if (period === "PM") {
+    if (hour !== 12) hour += 12;
+  } else if (hour >= 1 && hour < 7) {
+    hour += 12;
+  }
+
+  if (hour > 23 || minute > 59) return null;
+
+  return { hour, minute, originalHour, period };
+}
+
+function getRichTextLinks(richTextValue) {
+  if (!richTextValue) return [];
+
+  const links = [];
+  const fullText = richTextValue.getText ? richTextValue.getText() : "";
+  const fullLink = richTextValue.getLinkUrl ? richTextValue.getLinkUrl() : null;
+
+  if (fullLink) {
+    links.push({ text: fullText || fullLink, url: fullLink });
+  }
+
+  const runs = richTextValue.getRuns ? richTextValue.getRuns() : [];
+  runs.forEach((run) => {
+    const url = run.getLinkUrl ? run.getLinkUrl() : null;
+    if (!url || links.some((link) => link.url === url)) return;
+
+    const text = run.getText ? run.getText() : url;
+    links.push({ text: text || url, url });
+  });
+
+  return links;
+}
+
+function buildEventDescription(eventData) {
+  const lines = [SCRIPT_TAG];
+
+  if (eventData.note) {
+    lines.push("", "Notes:", eventData.note);
+  }
+
+  if (eventData.links.length > 0) {
+    lines.push("", "Links:");
+    eventData.links.forEach((link) => {
+      lines.push(`${link.text}: ${link.url}`);
+    });
+  }
+
+  return lines.join("\n");
+}
+
+function myFunction() {
+  createCalendarEvents();
+}
+
 function createCalendarEvents() {
   try {
-    Logger.log("🔄 Starting calendar sync");
+    log("🔄 Starting calendar sync");
 
-    const sheet = getTargetSheet();
-    if (!sheet) return;
+    const today = getTodayMidnight();
+    const sheets = getTargetSheets(today);
+    if (sheets.length === 0) return;
 
-    const { projectCallCal, interviewsCal } = getTargetCalendars();
-    const { events, projectKeys, interviewKeys } = extractSheetEvents(sheet);
+    const { projectCallCalendar, interviewsCalendar } = getTargetCalendars();
+    const { events, projectKeys, interviewKeys, parseFailureCount, syncStart, syncEnd } =
+      extractEventsFromSheets(sheets, today);
 
-    const deletedCount =
-      deleteRemovedEvents(projectCallCal, projectKeys, "Project call") +
-      deleteRemovedEvents(interviewsCal, interviewKeys, "Interviews");
-    Logger.log(`📋 Total deleted: ${deletedCount}`);
+    let deletedCount = 0;
+    if (events.length === 0 || parseFailureCount > 0) {
+      log(
+        `⚠️ Skipping stale-event deletion: extracted=${events.length}, parseFailures=${parseFailureCount}`
+      );
+    } else {
+      deletedCount =
+        deleteRemovedEvents(projectCallCalendar, projectKeys, "Project call", syncStart, syncEnd) +
+        deleteRemovedEvents(interviewsCalendar, interviewKeys, "Interviews", syncStart, syncEnd);
+    }
+    log(`📋 Total deleted: ${deletedCount}`);
 
-    const { createdCount, skippedCount } = syncSheetEvents(
+    const { createdCount, skippedCount, updatedCount } = syncSheetEvents(
       events,
-      projectCallCal,
-      interviewsCal
+      projectCallCalendar,
+      interviewsCalendar
     );
 
-    Logger.log("=".repeat(50));
-    Logger.log(
-      `📊 SUMMARY: Created=${createdCount}, Skipped=${skippedCount}, Deleted=${deletedCount}`
+    log("=".repeat(50));
+    log(
+      `📊 SUMMARY: Created=${createdCount}, Updated=${updatedCount}, Skipped=${skippedCount}, Deleted=${deletedCount}`
     );
-    Logger.log("✅ Calendar sync completed");
+    log("✅ Calendar sync completed");
   } catch (error) {
-    Logger.log(`❌ ERROR: ${error.toString()}`);
-    Logger.log(`Stack: ${error.stack}`);
+    log(`❌ ERROR: ${error.toString()}`);
+    log(`Stack: ${error.stack}`);
     throw error;
   }
 }
 
-function getTargetSheet() {
-  const ss = SpreadsheetApp.openById(SHEET_CONFIG.spreadsheetId);
-  Logger.log("✅ Spreadsheet opened");
+function getTodayMidnight() {
+  const todayStr = Utilities.formatDate(new Date(), TIMEZONE, "yyyy-MM-dd");
+  return Utilities.parseDate(todayStr, TIMEZONE, "yyyy-MM-dd");
+}
 
-  const sheet = ss.getSheetByName(SHEET_CONFIG.sheetName);
-  if (!sheet) {
-    Logger.log(`⚠️ Sheet '${SHEET_CONFIG.sheetName}' not found. Aborting.`);
-    return null;
+function parseSheetMonth(sheetName) {
+  const match = String(sheetName || "")
+    .trim()
+    .match(MONTH_SHEET_NAME_PATTERN);
+  if (!match) return null;
+
+  const monthToken = match[1].toLowerCase();
+
+  if (!(monthToken in MONTH_NAME_TO_INDEX)) return null;
+  return new Date(Number(match[2]), MONTH_NAME_TO_INDEX[monthToken], 1);
+}
+
+function getMonthEndExclusive(monthStart) {
+  return new Date(monthStart.getFullYear(), monthStart.getMonth() + 1, 1);
+}
+
+function getTargetSheets(today) {
+  const spreadsheet = SpreadsheetApp.openById(SHEET_CONFIG.spreadsheetId);
+  log("✅ Spreadsheet opened");
+
+  const monthSheets = spreadsheet
+    .getSheets()
+    .map((sheet) => ({ sheet, monthStart: parseSheetMonth(sheet.getName()) }))
+    .filter(({ monthStart }) => monthStart);
+
+  const sheets = monthSheets
+    .filter(({ monthStart }) => getMonthEndExclusive(monthStart) > today)
+    .sort(
+      (firstMonthSheet, secondMonthSheet) =>
+        firstMonthSheet.monthStart.getTime() - secondMonthSheet.monthStart.getTime()
+    )
+    .map(({ sheet }) => sheet);
+
+  if (sheets.length === 0) {
+    log("⚠️ No current or future month sheets found. Aborting.");
+    return [];
   }
-  Logger.log("✅ Sheet found");
-  return sheet;
+
+  log(`✅ Current/future sheets found: ${sheets.map((sheet) => sheet.getName()).join(", ")}`);
+  return sheets;
 }
 
 function getTargetCalendars() {
-  const allCals = CalendarApp.getAllCalendars();
-  const projectCallCal = allCals.find((c) => c.getName() === "Project call");
-  const interviewsCal = allCals.find((c) => c.getName() === "Interviews");
+  const calendars = CalendarApp.getAllCalendars();
+  const projectCallCalendar = calendars.find((calendar) => calendar.getName() === "Project call");
+  const interviewsCalendar = calendars.find((calendar) => calendar.getName() === "Interviews");
 
-  Logger.log(
-    `📅 Using calendars: Project call='${projectCallCal ? projectCallCal.getName() : "NOT FOUND"}', ` +
-      `Interviews='${interviewsCal ? interviewsCal.getName() : "NOT FOUND"}'`
+  log(
+    `📅 Using calendars: Project call='${projectCallCalendar ? projectCallCalendar.getName() : "NOT FOUND"}', ` +
+      `Interviews='${interviewsCalendar ? interviewsCalendar.getName() : "NOT FOUND"}'`
   );
 
-  return { projectCallCal, interviewsCal };
+  return { projectCallCalendar, interviewsCalendar };
 }
 
-function extractSheetEvents(sheet) {
-  const { startRow, lastRow, dateRow, dateCol, numDateCols, timeCol } =
+function extractEventsFromSheets(sheets, today) {
+  const combinedEvents = [];
+  const projectKeys = new Set();
+  const interviewKeys = new Set();
+  let parseFailureCount = 0;
+  let syncStart = today;
+  let syncEnd = null;
+
+  sheets.forEach((sheet) => {
+    const result = extractSheetEvents(sheet, today);
+    combinedEvents.push(...result.events);
+    result.projectKeys.forEach((eventKey) => projectKeys.add(eventKey));
+    result.interviewKeys.forEach((eventKey) => interviewKeys.add(eventKey));
+    parseFailureCount += result.parseFailureCount;
+
+    if (result.syncEnd && (!syncEnd || result.syncEnd > syncEnd)) {
+      syncEnd = result.syncEnd;
+    }
+  });
+
+  if (!syncEnd) {
+    syncEnd = new Date(today.getFullYear(), today.getMonth() + 1, today.getDate());
+  }
+
+  log(
+    `🔑 Sheet keys: ${projectKeys.size} project, ${interviewKeys.size} interview, parse failures=${parseFailureCount}`
+  );
+  return {
+    events: combinedEvents,
+    projectKeys,
+    interviewKeys,
+    parseFailureCount,
+    syncStart,
+    syncEnd,
+  };
+}
+
+function extractSheetEvents(sheet, today) {
+  const { startRow, lastRow, dateRow, dateColumn, dateColumnCount, timeColumn } =
     SHEET_CONFIG;
 
   const dateHeaders = sheet
-    .getRange(dateRow, dateCol, 1, numDateCols)
+    .getRange(dateRow, dateColumn, 1, dateColumnCount)
     .getDisplayValues()[0];
 
-  const timeValues = sheet
-    .getRange(startRow, timeCol, lastRow - startRow + 1, 1)
-    .getDisplayValues()
-    .flat();
+  const timeRange = sheet.getRange(startRow, timeColumn, lastRow - startRow + 1, 1);
+  const timeDisplayValues = timeRange.getDisplayValues().flat();
+  const timeRawValues = timeRange.getValues().flat();
 
-  const matrix = sheet
-    .getRange(startRow, dateCol, lastRow - startRow + 1, numDateCols)
-    .getDisplayValues();
+  const eventRange = sheet.getRange(
+    startRow,
+    dateColumn,
+    lastRow - startRow + 1,
+    dateColumnCount
+  );
+  const eventDisplayValues = eventRange.getDisplayValues();
+  const noteValues = eventRange.getNotes();
+  const richTextValues = eventRange.getRichTextValues();
+  const mergedRowSpans = getMergedRowSpans(eventRange, startRow, dateColumn);
 
   // Parse date headers into midnight dates
-  const midnights = dateHeaders.map((hdr) => {
-    const trimmed = String(hdr || "").trim();
-    if (!trimmed) return null;
+  const dateMidnights = dateHeaders.map((dateHeader) => {
+    const trimmedDateHeader = String(dateHeader || "").trim();
+    if (!trimmedDateHeader) return null;
 
-    // Try parseDate first (if headers look like "Jan 5, 2026")
-    let d = Utilities.parseDate(trimmed, TIMEZONE, "MMM d, yyyy");
-    if (isNaN(d)) {
+    // Try parseDate first (if headers look like "Mar 5, 2026")
+    let parsedDate = Utilities.parseDate(trimmedDateHeader, TIMEZONE, "MMM d, yyyy");
+    if (isNaN(parsedDate)) {
       // Fallback: Date constructor
-      d = new Date(trimmed);
+      parsedDate = new Date(trimmedDateHeader);
     }
-    if (isNaN(d)) return null;
+    if (isNaN(parsedDate)) return null;
 
-    return new Date(d.getFullYear(), d.getMonth(), d.getDate());
+    return new Date(parsedDate.getFullYear(), parsedDate.getMonth(), parsedDate.getDate());
   });
 
   const events = [];
+  let parseFailureCount = 0;
+  let latestSheetDate = null;
 
-  midnights.forEach((base, colIdx) => {
-    if (!base) return;
+  dateMidnights.forEach((eventDate, columnIndex) => {
+    if (!eventDate) return;
+    if (!latestSheetDate || eventDate > latestSheetDate) latestSheetDate = eventDate;
+    if (eventDate < today) return;
 
-    for (let rowIdx = 0; rowIdx < matrix.length; ) {
-      const raw = String(matrix[rowIdx][colIdx] || "").trim();
-      if (!raw) {
-        rowIdx++;
+    for (let rowIndex = 0; rowIndex < eventDisplayValues.length; ) {
+      const rawTitle = String(eventDisplayValues[rowIndex][columnIndex] || "").trim();
+      if (!rawTitle) {
+        rowIndex++;
         continue;
       }
 
-      const timeStr = String(timeValues[rowIdx] || "").trim();
-      const tm = timeStr.match(/(\d{1,2}):(\d{2})/);
+      const timeLabel = String(timeDisplayValues[rowIndex] || "").trim();
+      const parsedTime = parseSheetTime(timeLabel, timeRawValues[rowIndex]);
 
-      if (!tm) {
-        Logger.log(`⚠️ No time match for rowOffset=${rowIdx}: "${timeStr}"`);
-        rowIdx++;
+      if (!parsedTime) {
+        parseFailureCount++;
+        log(`⚠️ No time match for rowOffset=${rowIndex}: "${timeLabel}"`);
+        rowIndex++;
         continue;
       }
 
-      let [h, m] = tm.slice(1).map(Number);
-      const originalH = h;
+      const { hour, minute, originalHour } = parsedTime;
 
-      // Your original PM-fix heuristic (keep)
-      if (h >= 1 && h < 8) h += 12;
+      const rowSpan = mergedRowSpans[`${rowIndex}:${columnIndex}`] || 1;
 
-      const span =
-        getMergedRowSpan(sheet, startRow + rowIdx, dateCol + colIdx) || 1;
+      const startDateTime = new Date(eventDate);
+      startDateTime.setHours(hour, minute, 0, 0);
 
-      const startDT = new Date(base);
-      startDT.setHours(h, m, 0, 0);
+      const endDateTime = new Date(startDateTime);
+      endDateTime.setMinutes(endDateTime.getMinutes() + rowSpan * 30);
 
-      const endDT = new Date(startDT);
-      endDT.setMinutes(endDT.getMinutes() + span * 30);
-
-      const title = normalizeTitle(raw);
+      const title = normalizeTitle(rawTitle);
       const isProject =
-        PROJECT_CALL_TITLES.includes(raw) || raw.includes(UMBRAGE_KEYWORD);
+        PROJECT_CALL_TITLES.includes(rawTitle) || rawTitle.includes(UMBRAGE_KEYWORD);
 
-      const key = buildEventKey(title, startDT, endDT);
+      const eventKey = buildEventKey(title, startDateTime, endDateTime);
 
       events.push({
-        rawTitle: raw,
+        rawTitle,
         title,
-        start: startDT,
-        end: endDT,
-        span,
-        timeStr,
-        originalHour: originalH,
+        start: startDateTime,
+        end: endDateTime,
+        span: rowSpan,
+        timeLabel,
+        originalHour,
+        note: String(noteValues[rowIndex][columnIndex] || "").trim(),
+        links: getRichTextLinks(richTextValues[rowIndex][columnIndex]),
         isProject,
-        key,
+        key: eventKey,
       });
 
-      rowIdx += span;
+      rowIndex += rowSpan;
     }
   });
 
   const projectKeys = new Set();
   const interviewKeys = new Set();
-  events.forEach((evt) => (evt.isProject ? projectKeys : interviewKeys).add(evt.key));
+  events.forEach((eventData) =>
+    (eventData.isProject ? projectKeys : interviewKeys).add(eventData.key)
+  );
 
-  Logger.log(`🔑 Sheet keys: ${projectKeys.size} project, ${interviewKeys.size} interview`);
-  return { events, projectKeys, interviewKeys };
+  log(
+    `📄 ${sheet.getName()}: ${events.length} events, ${projectKeys.size} project, ${interviewKeys.size} interview, parse failures=${parseFailureCount}`
+  );
+  return {
+    events,
+    projectKeys,
+    interviewKeys,
+    parseFailureCount,
+    syncEnd: latestSheetDate
+      ? new Date(latestSheetDate.getFullYear(), latestSheetDate.getMonth(), latestSheetDate.getDate() + 1)
+      : null,
+  };
 }
 
-function syncSheetEvents(events, projectCallCal, interviewsCal) {
+function syncSheetEvents(events, projectCallCalendar, interviewsCalendar) {
   let createdCount = 0;
   let skippedCount = 0;
+  let updatedCount = 0;
 
-  events.forEach((evt) => {
-    const cal = evt.isProject ? projectCallCal : interviewsCal;
+  events.forEach((eventData) => {
+    const targetCalendar = eventData.isProject ? projectCallCalendar : interviewsCalendar;
 
-    if (!cal) {
-      Logger.log(`⚠️ Skipped (calendar missing): "${evt.title}" @ ${evt.start}`);
+    if (!targetCalendar) {
+      log(`⚠️ Skipped (calendar missing): "${eventData.title}" @ ${eventData.start}`);
       return;
     }
 
-    const exists = cal.getEvents(evt.start, evt.end).some((ev) => {
+    const existingEvent = targetCalendar.getEvents(eventData.start, eventData.end).find((calendarEvent) => {
       return (
-        normalizeTitle(ev.getTitle()) === evt.title &&
-        ev.getStartTime().getTime() === evt.start.getTime() &&
-        ev.getEndTime().getTime() === evt.end.getTime()
+        normalizeTitle(calendarEvent.getTitle()) === eventData.title &&
+        calendarEvent.getStartTime().getTime() === eventData.start.getTime() &&
+        calendarEvent.getEndTime().getTime() === eventData.end.getTime()
       );
     });
 
-    const timeStrFormatted = Utilities.formatDate(evt.start, TIMEZONE, "MMM d, h:mm a");
-    if (exists) {
+    const formattedStartTime = Utilities.formatDate(eventData.start, TIMEZONE, "MMM d, h:mm a");
+    const description = buildEventDescription(eventData);
+    if (existingEvent) {
+      if (existingEvent.getDescription() !== description) {
+        existingEvent.setDescription(description);
+        updatedCount++;
+        log(`📝 UPDATED [${targetCalendar.getName()}] "${eventData.title}" - ${formattedStartTime}`);
+        return;
+      }
+
       skippedCount++;
-      Logger.log(`⏩ SKIPPED [${cal.getName()}] "${evt.title}" - ${timeStrFormatted} (already exists)`);
+      log(`⏩ SKIPPED [${targetCalendar.getName()}] "${eventData.title}" - ${formattedStartTime} (already exists)`);
       return;
     }
 
-    cal.createEvent(evt.title, evt.start, evt.end, {
-      description: SCRIPT_TAG,
+    targetCalendar.createEvent(eventData.title, eventData.start, eventData.end, {
+      description,
     });
 
     createdCount++;
-    Logger.log(`✅ CREATED [${cal.getName()}] "${evt.title}" - ${timeStrFormatted}`);
+    log(`✅ CREATED [${targetCalendar.getName()}] "${eventData.title}" - ${formattedStartTime}`);
   });
 
-  return { createdCount, skippedCount };
+  return { createdCount, skippedCount, updatedCount };
 }
 
-function deleteRemovedEvents(calendar, sheetKeys, name) {
+function deleteRemovedEvents(calendar, expectedEventKeys, calendarName, syncStart, syncEnd) {
   if (!calendar) {
-    Logger.log(`⚠️ Cannot clean stale for [${name}] - calendar not found`);
+    log(`⚠️ Cannot clean stale for [${calendarName}] - calendar not found`);
     return 0;
   }
 
   let deletedCount = 0;
-  Logger.log(`🧹 Checking for stale events in [${name}]`);
+  const formattedSyncStart = Utilities.formatDate(syncStart, TIMEZONE, "MMM d, yyyy");
+  const formattedSyncEnd = Utilities.formatDate(syncEnd, TIMEZONE, "MMM d, yyyy");
+  log(`🧹 Checking for stale events in [${calendarName}] from ${formattedSyncStart} to ${formattedSyncEnd}`);
 
-  const now = new Date();
-  const future = new Date(now.getFullYear(), now.getMonth() + 1, now.getDate());
+  calendar.getEvents(syncStart, syncEnd).forEach((calendarEvent) => {
+    if (!String(calendarEvent.getDescription() || "").includes(SCRIPT_TAG)) return;
 
-  calendar.getEvents(now, future).forEach((ev) => {
-    const key = buildEventKey(normalizeTitle(ev.getTitle()), ev.getStartTime(), ev.getEndTime());
-    if (!sheetKeys.has(key)) {
-      const timeStr = Utilities.formatDate(ev.getStartTime(), TIMEZONE, "MMM d, h:mm a");
-      ev.deleteEvent();
+    const eventKey = buildEventKey(
+      normalizeTitle(calendarEvent.getTitle()),
+      calendarEvent.getStartTime(),
+      calendarEvent.getEndTime()
+    );
+    if (!expectedEventKeys.has(eventKey)) {
+      const formattedStartTime = Utilities.formatDate(calendarEvent.getStartTime(), TIMEZONE, "MMM d, h:mm a");
+      calendarEvent.deleteEvent();
       deletedCount++;
-      Logger.log(`🗑️ DELETED [${name}] "${ev.getTitle()}" - ${timeStr} (not in sheet)`);
+      log(`🗑️ DELETED [${calendarName}] "${calendarEvent.getTitle()}" - ${formattedStartTime} (not in sheet)`);
     }
   });
 
-  if (deletedCount === 0) Logger.log(`✓ No stale events to delete in [${name}]`);
+  if (deletedCount === 0) log(`✓ No stale events to delete in [${calendarName}]`);
   return deletedCount;
 }
 
-function getMergedRowSpan(sheet, row, col) {
-  const r = sheet.getRange(row, col);
-  if (!r.isPartOfMerge()) return 1;
+function getMergedRowSpans(range, startRow, startColumn) {
+  const spans = {};
 
-  const merged = r
-    .getMergedRanges()
-    .find((m) => m.getRow() <= row && row <= m.getLastRow());
+  range.getMergedRanges().forEach((mergedRange) => {
+    const rowOffset = mergedRange.getRow() - startRow;
+    const columnOffset = mergedRange.getColumn() - startColumn;
 
-  return merged ? merged.getNumRows() : 1;
+    if (rowOffset < 0 || columnOffset < 0) return;
+    spans[`${rowOffset}:${columnOffset}`] = mergedRange.getNumRows();
+  });
+
+  return spans;
 }
